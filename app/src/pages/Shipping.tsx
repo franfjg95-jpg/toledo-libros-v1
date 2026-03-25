@@ -3,6 +3,7 @@ import { Truck, Search, MapPin, Package, Clock, Edit, Printer, X, CheckSquare, C
 import { collection, onSnapshot, query, orderBy, doc, updateDoc } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { useReactToPrint } from 'react-to-print';
+import { AestheticAlert } from '../components/Alert';
 
 interface Shipment {
   id: string;
@@ -47,6 +48,14 @@ export const Shipping: React.FC = () => {
   const [formStatus, setFormStatus] = useState('');
   const [formTracking, setFormTracking] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+  
+  // Custom Alert State
+  const [alertConfig, setAlertConfig] = useState({ 
+    isOpen: false, 
+    message: '', 
+    type: 'error' as 'error' | 'success' | 'info' | 'warning' | 'confirm',
+    onConfirm: undefined as (() => void) | undefined
+  });
 
   // Print Label Modal
   const [printingLabel, setPrintingLabel] = useState<Shipment | null>(null);
@@ -85,9 +94,10 @@ export const Shipping: React.FC = () => {
         tracking: formTracking,
       });
       setEditingShip(null);
+      window.location.reload();
     } catch (err) {
       console.error(err);
-      alert('Error al actualizar el estado del envío.');
+      setAlertConfig({ isOpen: true, message: 'Error al actualizar el estado del envío.', type: 'error', onConfirm: undefined });
     } finally {
       setIsSaving(false);
     }
@@ -178,7 +188,9 @@ export const Shipping: React.FC = () => {
                 filteredShipments.map((ship) => (
                   <tr key={ship.id} className="hover:bg-gray-50 transition-colors group">
                     <td className="py-4 px-6 text-sm text-gray-700 font-medium align-top whitespace-nowrap">
-                      {ship.shippingDate ? new Date(ship.shippingDate.toDate()).toLocaleDateString('es-AR') : '—'}
+                      {ship.shippingDate && typeof ship.shippingDate.toDate === 'function' 
+                        ? ship.shippingDate.toDate().toLocaleDateString('es-AR') 
+                        : '—'}
                     </td>
 
                     <td className="py-4 px-6 align-top">
@@ -349,6 +361,14 @@ export const Shipping: React.FC = () => {
           </div>
         </div>
       )}
+      {/* Custom Alert Overlay */}
+      <AestheticAlert 
+        isOpen={alertConfig.isOpen} 
+        message={alertConfig.message} 
+        type={alertConfig.type} 
+        onClose={() => setAlertConfig({ ...alertConfig, isOpen: false, onConfirm: undefined })} 
+        onConfirm={alertConfig.onConfirm}
+      />
     </div>
   );
 };

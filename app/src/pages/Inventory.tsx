@@ -1,9 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Plus, Search, X, BookOpen, Upload, Image as ImageIcon, Edit2, Trash2 } from 'lucide-react';
+import { Plus, Search, X, BookOpen, Image as ImageIcon, Edit2, Trash2, CheckCircle, AlertCircle, HelpCircle, Eye } from 'lucide-react';
 import { collection, onSnapshot, addDoc, serverTimestamp, doc, updateDoc, deleteDoc } from 'firebase/firestore';
-import { ref, uploadBytesResumable, getDownloadURL, deleteObject } from 'firebase/storage';
-import { db, storage } from '../lib/firebase';
-import imageCompression from 'browser-image-compression';
+import { EmailAuthProvider, reauthenticateWithCredential } from 'firebase/auth';
+import { db, auth } from '../lib/firebase';
 
 export interface Book {
   id?: string;
@@ -13,6 +12,7 @@ export interface Book {
   branch: string;
   editorial: string;
   volume: string;
+  pages: number;
   ubicacionFisica: string;
   price: number;
   stock: number;
@@ -22,7 +22,7 @@ export interface Book {
 }
 
 const initialFormStatus = {
-  isbn: '', title: '', author: '', branch: '', editorial: '', volume: '', ubicacionFisica: '', price: 0, stock: 0, editionDate: '', imageUrl: ''
+  isbn: '', title: '', author: '', branch: '', editorial: '', volume: '', pages: 0, ubicacionFisica: '', price: 0, stock: 0, editionDate: '', imageUrl: ''
 };
 
 export const Inventory: React.FC = () => {
@@ -32,9 +32,43 @@ export const Inventory: React.FC = () => {
   const [form, setForm] = useState<Omit<Book, 'id' | 'createdAt'>>(initialFormStatus);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [editingBookId, setEditingBookId] = useState<string | null>(null);
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<number>(0);
+  
+  // Estados para Feedback y Confirmación
+  const [isSaveConfirmOpen, setIsSaveConfirmOpen] = useState(false);
+  const [bookToDelete, setBookToDelete] = useState<Book | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [deletePassword, setDeletePassword] = useState('');
+
+  // Transformador de Links de Google Drive a links directos de imagen
+  const transformDriveUrl = (url: string): string => {
+    if (!url || !url.includes('drive.google.com')) return url;
+    try {
+      // Intenta extraer el ID del patrón /d/ID/... o id=ID
+      const fileIdMatch = url.match(/\/d\/(.+?)\//) || url.match(/id=(.+?)(&|$)/);
+      const fileId = fileIdMatch ? fileIdMatch[1] : null;
+      if (fileId) {
+        return `https://lh3.googleusercontent.com/u/0/d/${fileId}`;
+      }
+    } catch (e) {
+      console.warn("Fallo al transformar link de Drive:", e);
+    }
+    return url;
+  };
+
+  useEffect(() => {
+    if (successMessage) {
+      const timer = setTimeout(() => setSuccessMessage(null), 2500);
+      return () => clearTimeout(timer);
+    }
+  }, [successMessage]);
+
+  useEffect(() => {
+    if (errorMessage) {
+      const timer = setTimeout(() => setErrorMessage(null), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [errorMessage]);
 
   useEffect(() => {
     const booksRef = collection(db, 'books');
@@ -51,31 +85,22 @@ export const Inventory: React.FC = () => {
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
     const { name, value } = e.target;
+    let finalValue = value;
+
+    // Si es el campo de imagen, aplicar transformación de Drive
+    if (name === 'imageUrl') {
+      finalValue = transformDriveUrl(value);
+    }
+
     setForm((prev) => ({
       ...prev,
-      [name]: name === 'price' || name === 'stock' ? Number(value) : value,
+      [name]: name === 'price' || name === 'stock' || name === 'pages' ? Number(value) : finalValue,
     }));
-  };
-
-  const handleImageChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      const options = { maxSizeMB: 0.5, maxWidthOrHeight: 800, useWebWorker: true };
-      try {
-        const compressedFile = await imageCompression(file, options);
-        setImageFile(compressedFile);
-        setImagePreviewUrl(URL.createObjectURL(compressedFile));
-      } catch (error) {
-        console.error("Error comprimiendo imagen", error);
-      }
-    }
   };
 
   const openFormForAdd = () => {
     setForm(initialFormStatus);
     setEditingBookId(null);
-    setImageFile(null);
-    setImagePreviewUrl(null);
     setIsModalOpen(true);
   };
 
@@ -87,6 +112,7 @@ export const Inventory: React.FC = () => {
       branch: book.branch,
       editorial: book.editorial || '',
       volume: book.volume || '',
+      pages: book.pages || 0,
       ubicacionFisica: book.ubicacionFisica || '',
       price: book.price,
       stock: book.stock,
@@ -94,83 +120,96 @@ export const Inventory: React.FC = () => {
       imageUrl: book.imageUrl || ''
     });
     setEditingBookId(book.id!);
-    setImagePreviewUrl(book.imageUrl || null);
-    setImageFile(null);
     setIsModalOpen(true);
   };
 
-  const handleDeleteBook = async (book: Book) => {
-    const isConfirmed = window.confirm(`¿Estás seguro de eliminar la obra "${book.title}"?\nEsta acción es irreversible.`);
-    if (isConfirmed) {
-      try {
-        if (book.imageUrl) {
-          try {
-            const imgRef = ref(storage, book.imageUrl);
-            await deleteObject(imgRef);
-          } catch(e) { console.error("No se pudo borrar portada en Storage", e); }
-        }
-        await deleteDoc(doc(db, 'books', book.id!));
-      } catch (error) {
-        console.error("Error al eliminar obra", error);
-        alert("Ocurrió un error al eliminar.");
+  const handleDeleteBook = (book: Book) => {
+    setBookToDelete(book);
+    setDeletePassword(''); // Reset password input
+  };
+
+  const confirmDelete = async () => {
+    if (!bookToDelete) return;
+    
+    // Medida de Seguridad: Re-autenticación
+    const user = auth.currentUser;
+    if (!user || !user.email) {
+      setErrorMessage("Debe estar logueado para eliminar.");
+      return;
+    }
+
+    if (!deletePassword) {
+      setErrorMessage("Por favor, ingrese su contraseña de seguridad.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const credential = EmailAuthProvider.credential(user.email, deletePassword);
+      await reauthenticateWithCredential(user, credential);
+      
+      // Si llega aquí, la contraseña es correcta
+      await deleteDoc(doc(db, 'books', bookToDelete.id!));
+      setSuccessMessage('Obra eliminada permanentemente');
+      setBookToDelete(null);
+      setDeletePassword('');
+    } catch (error: any) {
+      console.error("Error en validación de seguridad", error);
+      if (error.code === 'auth/wrong-password' || error.code === 'auth/invalid-credential') {
+        setErrorMessage("Contraseña Incorrecta. Acceso Denegado.");
+      } else {
+        setErrorMessage("Error de seguridad: " + error.message);
       }
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleSubmit = (e: React.FormEvent) => {
+    if (e) e.preventDefault();
+    setIsSaveConfirmOpen(true);
+  };
+
+  const handleActualSubmit = async () => {
+    if (isSubmitting) return;
+
+    setIsSaveConfirmOpen(false);
+    console.log('--- INICIO PROCESO GUARDADO (LINK EXTERNO) ---');
     setIsSubmitting(true);
-    setUploadProgress(0);
+    
     try {
-      let finalImageUrl = form.imageUrl || '';
-
-      if (imageFile) {
-        // Optimización: Eliminar imagen anterior del Storage si se sube una nueva
-        if (editingBookId && form.imageUrl) {
-           try {
-             const oldImgRef = ref(storage, form.imageUrl);
-             await deleteObject(oldImgRef);
-           } catch (e) { console.log('Precaución: No se pudo borrar la imagen anterior.'); }
-        }
-
-        const storageRef = ref(storage, `books/${Date.now()}_${imageFile.name}`);
-        const uploadTask = uploadBytesResumable(storageRef, imageFile);
-        
-        await new Promise<void>((resolve, reject) => {
-          uploadTask.on('state_changed', 
-            (snapshot) => {
-              const progress = (snapshot.bytesTransferred / snapshot.totalBytes) * 100;
-              setUploadProgress(progress);
-            }, 
-            (error) => reject(error), 
-            async () => {
-              finalImageUrl = await getDownloadURL(uploadTask.snapshot.ref);
-              resolve();
-            }
-          );
-        });
-      }
-
-      const submissionData = { ...form, imageUrl: finalImageUrl };
+      const sanitizedBook = {
+        isbn: String(form.isbn || ''),
+        title: String(form.title || ''),
+        author: String(form.author || ''),
+        branch: String(form.branch || ''),
+        editorial: String(form.editorial || ''),
+        volume: String(form.volume || ''),
+        pages: Number(form.pages) || 0,
+        ubicacionFisica: String(form.ubicacionFisica || ''),
+        price: Number(form.price) || 0,
+        stock: Number(form.stock) || 0,
+        editionDate: String(form.editionDate || ''),
+        imageUrl: form.imageUrl || "" 
+      };
 
       if (editingBookId) {
-         await updateDoc(doc(db, 'books', editingBookId), submissionData);
+         await updateDoc(doc(db, 'books', editingBookId), sanitizedBook);
       } else {
          await addDoc(collection(db, 'books'), {
-           ...submissionData,
+           ...sanitizedBook,
            createdAt: serverTimestamp(),
          });
       }
       
+      setSuccessMessage('Obra guardada correctamente');
       setForm(initialFormStatus);
-      setImageFile(null);
-      setImagePreviewUrl(null);
       setEditingBookId(null);
-      setUploadProgress(0);
       setIsModalOpen(false);
-    } catch (error) {
-      console.error("Error al guardar obra: ", error);
-      alert("Error al guardar los datos.");
+
+    } catch (error: any) {
+      console.error('Error Crítico:', error);
+      setErrorMessage('Error al guardar: ' + (error.message || 'Error desconocido'));
     } finally {
       setIsSubmitting(false);
     }
@@ -208,8 +247,20 @@ export const Inventory: React.FC = () => {
               placeholder="Buscar por Título, Autor, Editorial o ISBN..." 
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-navy-600 focus:border-transparent text-sm"
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') setSearchTerm('');
+              }}
+              className="w-full pl-10 pr-10 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-navy-600 focus:border-transparent text-sm"
             />
+            {searchTerm && (
+              <button 
+                onClick={() => setSearchTerm('')}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-navy-600 transition-colors p-1"
+                title="Limpiar búsqueda"
+              >
+                <X size={16} />
+              </button>
+            )}
           </div>
         </div>
 
@@ -220,8 +271,10 @@ export const Inventory: React.FC = () => {
                 <th className="py-4 px-6 font-semibold w-16 text-center">Portada</th>
                 <th className="py-4 px-6 font-semibold min-w-[280px]">Obra, Autor y Edit.</th>
                 <th className="py-4 px-6 font-semibold">Rama</th>
-                <th className="py-4 px-6 font-semibold text-center">Tomo/Ed.</th>
-                <th className="py-4 px-6 font-semibold text-center">Ubicación F.</th>
+                <th className="py-4 px-6 font-semibold text-center">Tomo - Articulos</th>
+                <th className="py-4 px-6 font-semibold text-center uppercase tracking-tight">Año</th>
+                <th className="py-4 px-6 font-semibold text-center uppercase tracking-tight">Páginas</th>
+                <th className="py-4 px-6 font-semibold text-center">Ubicacion</th>
                 <th className="py-4 px-6 font-semibold text-right">Precio</th>
                 <th className="py-4 px-6 font-semibold text-center">Stock</th>
                 <th className="py-4 px-6 font-semibold text-center">Acciones</th>
@@ -230,7 +283,7 @@ export const Inventory: React.FC = () => {
             <tbody className="divide-y divide-gray-100">
               {books.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-12 text-center text-gray-500">
+                  <td colSpan={10} className="py-12 text-center text-gray-500">
                     <div className="flex flex-col items-center justify-center">
                       <BookOpen className="w-12 h-12 text-gray-300 mb-3" />
                       <p className="text-lg font-medium text-gray-600">El catálogo está vacío.</p>
@@ -240,7 +293,7 @@ export const Inventory: React.FC = () => {
                 </tr>
               ) : filteredBooks.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-8 text-center text-gray-500">
+                  <td colSpan={10} className="py-8 text-center text-gray-500">
                     No se encontraron coincidencias.
                   </td>
                 </tr>
@@ -248,13 +301,39 @@ export const Inventory: React.FC = () => {
                 filteredBooks.map((book) => (
                   <tr key={book.id} className="hover:bg-gray-50 transition-colors group">
                     <td className="py-4 px-6 text-center">
-                      {book.imageUrl ? (
-                        <img src={book.imageUrl} alt={book.title} className="w-10 h-14 object-cover rounded shadow-sm border border-gray-200 mx-auto" />
-                      ) : (
-                        <div className="w-10 h-14 mx-auto bg-gray-100 rounded border border-gray-200 flex items-center justify-center text-gray-400 shadow-sm">
-                           <ImageIcon size={16} />
+                      <div className="flex flex-col items-center gap-2">
+                        <div className="mx-auto w-10 h-14 overflow-hidden rounded shadow-sm border border-gray-200 bg-white">
+                          {book.imageUrl ? (
+                            <img 
+                              src={book.imageUrl} 
+                              alt={book.title} 
+                              className="w-full h-full object-cover" 
+                              onError={(e) => {
+                                (e.target as HTMLImageElement).src = 'https://via.placeholder.com/150?text=Error';
+                              }}
+                            />
+                          ) : (
+                            <div className="w-full h-full bg-gray-50 flex items-center justify-center text-gray-300">
+                               <ImageIcon size={16} />
+                            </div>
+                          )}
                         </div>
-                      )}
+                        {book.imageUrl ? (
+                          <a 
+                            href={book.imageUrl} 
+                            target="_blank" 
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 text-[10px] font-bold text-blue-500 hover:text-blue-700 transition-colors uppercase tracking-tight"
+                            title="Ver imagen completa"
+                          >
+                            <Eye size={10} /> Ver
+                          </a>
+                        ) : (
+                          <span className="text-[10px] font-bold text-gray-300 uppercase tracking-tight flex items-center gap-1 cursor-not-allowed">
+                             S/F
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td className="py-4 px-6">
                       <p className="font-semibold text-gray-900 group-hover:text-navy-700 leading-snug">{book.title}</p>
@@ -268,7 +347,14 @@ export const Inventory: React.FC = () => {
                     </td>
                     <td className="py-4 px-6 text-center">
                       <p className="text-sm font-medium text-gray-800">{book.volume || '-'}</p>
-                      <p className="text-xs text-gray-500">{book.editionDate}</p>
+                    </td>
+                    <td className="py-4 px-6 text-center">
+                      <p className="text-sm text-gray-500 font-bold">{book.editionDate || 'S/D'}</p>
+                    </td>
+                    <td className="py-4 px-6 text-center">
+                      <span className="text-sm text-gray-600 font-mono italic">
+                        {book.pages || '0'} pág.
+                      </span>
                     </td>
                     <td className="py-4 px-6 text-center">
                       <span className="text-sm font-medium text-amber-800 bg-amber-50 px-2.5 py-1 rounded-md border border-amber-100 whitespace-nowrap">
@@ -324,55 +410,76 @@ export const Inventory: React.FC = () => {
                 </button>
               </div>
               
-              <div className="flex-1 overflow-y-auto px-6 py-6">
-                <form id="book-form" onSubmit={handleSubmit} className="space-y-4">
-                  <div className="flex flex-col items-center justify-center w-full mb-4">
-                    <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-gray-300 rounded-lg cursor-pointer bg-gray-50 hover:bg-gray-100 transition-colors relative overflow-hidden group">
-                      <div className="flex flex-col items-center justify-center pt-5 pb-6">
-                        {imagePreviewUrl ? (
-                          <>
-                            <img src={imagePreviewUrl} alt="Preview" className="absolute inset-0 w-full h-full object-contain p-2 blur-[2px] opacity-40 group-hover:opacity-20 transition-opacity" />
-                            <img src={imagePreviewUrl} alt="Preview" className="h-28 object-contain relative z-10 shadow-sm" />
-                          </>
-                        ) : (
-                          <>
-                            <Upload className="w-8 h-8 mb-2 text-gray-400 group-hover:text-navy-500 transition-colors" />
-                            <p className="text-sm text-gray-500 font-semibold">Click para subir Portada</p>
-                            <p className="text-xs text-gray-400 mt-1">PNG, JPG (Máx ~500kb)</p>
-                          </>
-                        )}
-                      </div>
-                      <input type="file" className="hidden" accept="image/*" onChange={handleImageChange} />
-                    </label>
-                    {uploadProgress > 0 && uploadProgress < 100 && (
-                      <div className="w-full bg-gray-200 rounded-full h-1.5 mt-3 overflow-hidden">
-                        <div className="bg-navy-600 h-1.5 rounded-full transition-all duration-300" style={{ width: `${uploadProgress}%` }}></div>
+              <div className="flex-1 overflow-y-auto px-6 py-6 font-sans">
+                {/* Visual Cover Preview Header */}
+                <div className="mb-6">
+                  <div className="flex items-center gap-3 mb-3">
+                    <div className="p-2 bg-navy-50 text-navy-800 rounded-lg">
+                      <ImageIcon size={20} />
+                    </div>
+                    <h3 className="font-bold text-navy-900">Vista Previa de Portada</h3>
+                  </div>
+                  
+                  <div className="w-full aspect-[4/3] bg-gray-50 rounded-xl border-2 border-dashed border-gray-200 flex flex-col items-center justify-center overflow-hidden">
+                    {form.imageUrl ? (
+                      <img 
+                        src={form.imageUrl} 
+                        alt="Preview" 
+                        className="w-full h-full object-contain p-2"
+                        onError={(e) => {
+                          (e.target as HTMLImageElement).src = 'https://via.placeholder.com/150?text=Link+Inv%C3%A1lido';
+                        }}
+                      />
+                    ) : (
+                      <div className="text-center p-6 bg-white w-full h-full flex flex-col items-center justify-center">
+                         <div className="w-16 h-16 bg-gray-50 rounded-full border border-gray-100 flex items-center justify-center mb-3">
+                            <BookOpen className="text-gray-300" size={32} />
+                         </div>
+                         <p className="text-xs font-semibold text-gray-400">Pega un link de imagen abajo para previsualizar</p>
                       </div>
                     )}
                   </div>
-                  <div>
+                </div>
+
+                <form id="book-form" onSubmit={handleSubmit} className="space-y-4">
+                  <div className="p-3 bg-navy-50/50 rounded-lg border border-navy-100">
+                    <label className="block text-xs font-bold text-navy-800 mb-1 uppercase tracking-wider">Pegar Link de Portada</label>
+                    <input 
+                      type="url" 
+                      name="imageUrl" 
+                      placeholder="https://ejemplo.com/imagen.jpg o link de Google Drive" 
+                      value={form.imageUrl} 
+                      onChange={handleInputChange} 
+                      className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-600 focus:border-navy-600 sm:text-sm bg-white" 
+                    />
+                    <p className="text-[10px] text-navy-600 mt-1.5 flex items-center gap-1">
+                      <CheckCircle size={10} /> Soporta transformación automática de Google Drive
+                    </p>
+                  </div>
+
+                  <div className="pt-2 border-t border-gray-100">
                     <label className="block text-sm font-medium text-gray-700 mb-1">ISBN</label>
-                    <input required type="text" name="isbn" value={form.isbn} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
+                    <input type="text" name="isbn" value={form.isbn} onChange={handleInputChange} required className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
                   </div>
                   
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Título de la Obra</label>
-                    <input required type="text" name="title" value={form.title} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
+                    <input type="text" name="title" value={form.title} onChange={handleInputChange} required className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
                   </div>
                   
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Autor / Coautores</label>
-                    <input required type="text" name="author" value={form.author} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
+                    <input type="text" name="author" value={form.author} onChange={handleInputChange} required className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
                   </div>
 
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">Editorial</label>
-                      <input required type="text" name="editorial" placeholder="Ej: Astrea, La Ley" value={form.editorial} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
+                      <input type="text" name="editorial" placeholder="Ej: Astrea, La Ley" value={form.editorial} onChange={handleInputChange} required className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">Rama del Derecho</label>
-                      <select required name="branch" value={form.branch} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm bg-white">
+                      <select name="branch" value={form.branch} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm bg-white">
                         <option value="">Seleccione...</option>
                         <option value="Derecho Penal">Derecho Penal</option>
                         <option value="Derecho Civil">Derecho Civil</option>
@@ -389,26 +496,31 @@ export const Inventory: React.FC = () => {
                       <input type="text" name="volume" placeholder="Ej: I, II, Único" value={form.volume} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
                     </div>
                     <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Fecha Edición</label>
-                      <input required type="text" name="editionDate" placeholder="Ej: 2024" value={form.editionDate} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
+                      <label className="block text-sm font-medium text-gray-700 mb-1">Cantidad de Páginas</label>
+                      <input type="number" min="0" name="pages" placeholder="0" value={form.pages} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
                     </div>
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Fecha Edición</label>
+                    <input type="text" name="editionDate" placeholder="Ej: 2024" value={form.editionDate} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm" />
                   </div>
 
                   <div className="pt-2 border-t border-gray-100">
                     <label className="block text-sm font-medium text-navy-800 mb-1 flex items-center gap-2">
                        Ubicación Física Logística
                     </label>
-                    <input required type="text" name="ubicacionFisica" placeholder="Ej: Estante A, Fila 1" value={form.ubicacionFisica} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm bg-gray-50" />
+                    <input type="text" name="ubicacionFisica" placeholder="Ej: Estante A, Fila 1" value={form.ubicacionFisica} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm bg-gray-50" />
                   </div>
 
                   <div className="grid grid-cols-2 gap-4 pb-2">
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">Precio Unitario ($)</label>
-                      <input required type="number" min="0" step="0.01" name="price" value={form.price} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm font-bold text-navy-900" />
+                      <input type="number" min="0" step="0.01" name="price" value={form.price} onChange={handleInputChange} required className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm font-bold text-navy-900" />
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-700 mb-1">Stock Inicial</label>
-                      <input required type="number" min="0" name="stock" value={form.stock} onChange={handleInputChange} className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm font-bold text-navy-900" />
+                      <input type="number" min="0" name="stock" value={form.stock} onChange={handleInputChange} required className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-navy-500 focus:border-navy-500 sm:text-sm font-bold text-navy-900" />
                     </div>
                   </div>
                 </form>
@@ -428,6 +540,104 @@ export const Inventory: React.FC = () => {
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de Confirmación de Guardado */}
+      {isSaveConfirmOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black bg-opacity-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-sm w-full p-6 animate-in fade-in zoom-in duration-200">
+            <div className="flex flex-col items-center text-center">
+              <div className="w-12 h-12 bg-navy-50 text-navy-600 rounded-full flex items-center justify-center mb-4">
+                <HelpCircle size={28} />
+              </div>
+              <h3 className="text-lg font-bold text-gray-900 mb-2">¿Desea guardar esta obra en el catálogo?</h3>
+              <p className="text-sm text-gray-500 mb-6">Esta acción registrará la información de forma permanente.</p>
+              <div className="flex gap-3 w-full">
+                <button 
+                  onClick={() => setIsSaveConfirmOpen(false)}
+                  className="flex-1 px-4 py-2 border border-gray-300 text-gray-700 rounded-md hover:bg-gray-50 transition-colors text-sm font-medium"
+                >
+                  Cancelar
+                </button>
+                <button 
+                  onClick={handleActualSubmit}
+                  className="flex-1 px-4 py-2 bg-navy-800 text-white rounded-md hover:bg-navy-700 transition-colors text-sm font-medium"
+                >
+                  Confirmar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de Confirmación de Eliminación */}
+      {bookToDelete && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black bg-opacity-50 px-4">
+          <div className="bg-white rounded-lg shadow-2xl max-w-sm w-full p-6 animate-in fade-in zoom-in duration-200 border border-gray-100">
+            <div className="flex flex-col items-center">
+              <div className="w-16 h-16 bg-red-50 text-red-600 rounded-full flex items-center justify-center mb-4 shadow-inner">
+                <AlertCircle size={32} />
+              </div>
+              <h3 className="text-xl font-bold text-navy-950 mb-2">Seguridad de Eliminación</h3>
+              <p className="text-sm text-gray-500 mb-6 text-center">
+                ¿Está seguro de eliminar <span className="font-bold text-red-700 italic">"{bookToDelete.title}"</span>? Esta acción no se puede deshacer.
+              </p>
+              
+              <div className="w-full space-y-4 mb-6">
+                <div className="p-4 bg-gray-50 rounded-lg border border-gray-200">
+                    <label className="block text-[10px] font-bold text-navy-800 mb-1.5 uppercase tracking-widest">Contraseña de Usuario</label>
+                    <input 
+                      type="password" 
+                      placeholder="Ingrese su clave para confirmar"
+                      value={deletePassword}
+                      onChange={(e) => setDeletePassword(e.target.value)}
+                      className="w-full border border-gray-300 rounded-md py-2 px-3 focus:ring-red-500 focus:border-red-500 sm:text-sm bg-white shadow-sm"
+                      autoFocus
+                    />
+                </div>
+              </div>
+
+              <div className="flex gap-3 w-full">
+                <button 
+                  onClick={() => { setBookToDelete(null); setDeletePassword(''); }}
+                  className="flex-1 px-4 py-2 border border-blue-200 text-navy-600 rounded-md hover:bg-navy-50 transition-colors text-sm font-bold uppercase tracking-wider"
+                  disabled={isSubmitting}
+                >
+                  Volver
+                </button>
+                <button 
+                  onClick={confirmDelete}
+                  disabled={isSubmitting || !deletePassword}
+                  className="flex-1 px-4 py-2 bg-red-700 text-white rounded-md hover:bg-red-800 transition-colors text-sm font-bold uppercase tracking-wider shadow-md disabled:opacity-50"
+                >
+                  {isSubmitting ? 'Validando...' : 'ELIMINAR'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast de Éxito */}
+      {successMessage && (
+        <div className="fixed bottom-6 right-6 z-[70] animate-in slide-in-from-right duration-300">
+          <div className="bg-navy-900 text-white px-6 py-4 rounded-lg shadow-2xl flex items-center gap-3 border border-navy-700 border-l-4 border-l-emerald-500">
+            <CheckCircle className="text-emerald-400" size={20} />
+            <span className="font-medium">{successMessage}</span>
+          </div>
+        </div>
+      )}
+
+      {/* Toast de Error */}
+      {errorMessage && (
+        <div className="fixed bottom-6 right-6 z-[70] animate-in slide-in-from-right duration-300">
+          <div className="bg-red-900 text-white px-6 py-4 rounded-lg shadow-2xl flex items-center gap-3 border border-red-700 border-l-4 border-l-red-300">
+            <AlertCircle className="text-red-300" size={20} />
+            <span className="font-medium text-sm">{errorMessage}</span>
+            <button onClick={() => setErrorMessage(null)} className="ml-2 hover:text-white/80"><X size={14}/></button>
           </div>
         </div>
       )}

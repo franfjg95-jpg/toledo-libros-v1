@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { DollarSign, Library, ShoppingCart, TrendingUp, AlertTriangle, ArrowRight } from 'lucide-react';
-import { collection, onSnapshot, query, orderBy, limit } from 'firebase/firestore';
+import { DollarSign, Library, TrendingUp, AlertTriangle, ArrowRight } from 'lucide-react';
+import { collection, onSnapshot, query, orderBy } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { format, subDays, startOfDay, isSameMonth, isToday } from 'date-fns';
@@ -12,6 +12,7 @@ interface Book {
   author: string;
   price: number;
   stock: number;
+  pages?: number;
 }
 
 interface Sale {
@@ -20,6 +21,7 @@ interface Sale {
   saleDate: any;
   items: any[];
   customerName: string;
+  paymentMethod?: string;
 }
 
 export const Dashboard: React.FC = () => {
@@ -53,14 +55,16 @@ export const Dashboard: React.FC = () => {
   // 1. Cálculos de Widgets
   const today = new Date();
   
-  const todaySales = sales.filter(s => s.saleDate && isToday(s.saleDate.toDate()));
+  const getSafeDate = (ts: any) => (ts && typeof ts.toDate === 'function' ? ts.toDate() : new Date());
+  
+  const todaySales = sales.filter(s => s.saleDate && isToday(getSafeDate(s.saleDate)));
   const todayRevenue = todaySales.reduce((acc, s) => acc + s.totalAmount, 0);
 
   const totalBooksSold = sales.reduce((acc, s) => {
     return acc + (s.items?.reduce((sum: number, item: any) => sum + item.quantity, 0) || 0);
   }, 0);
 
-  const monthSales = sales.filter(s => s.saleDate && isSameMonth(s.saleDate.toDate(), today));
+  const monthSales = sales.filter(s => s.saleDate && isSameMonth(getSafeDate(s.saleDate), today));
   const monthRevenue = monthSales.reduce((acc, s) => acc + s.totalAmount, 0);
 
   const lowStockBooks = books.filter(b => b.stock < 3);
@@ -73,7 +77,7 @@ export const Dashboard: React.FC = () => {
     // Ventas de ese día específico
     const daySales = sales.filter(s => {
       if (!s.saleDate) return false;
-      const saleD = s.saleDate.toDate();
+      const saleD = getSafeDate(s.saleDate);
       return saleD >= dayStart && saleD < new Date(dayStart.getTime() + 86400000); // menores al próximo día
     });
 
@@ -165,7 +169,7 @@ export const Dashboard: React.FC = () => {
                 <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{fill: '#6b7280', fontSize: 12}} dy={10} />
                 <YAxis axisLine={false} tickLine={false} tick={{fill: '#6b7280', fontSize: 12}} tickFormatter={(value) => `$${value}`} />
                 <Tooltip 
-                  formatter={(value: number) => [`$${value.toFixed(2)}`, 'Ingresos']}
+                  formatter={(value: any) => [`$${Number(value || 0).toFixed(2)}`, 'Ingresos']}
                   contentStyle={{ borderRadius: '8px', border: 'none', boxShadow: '0 4px 6px -1px rgba(0, 0, 0, 0.1)' }}
                 />
                 <Area type="monotone" dataKey="ventas" stroke="#1e3a8a" strokeWidth={3} fillOpacity={1} fill="url(#colorVentas)" />
@@ -191,7 +195,7 @@ export const Dashboard: React.FC = () => {
                       <div>
                         <p className="text-sm font-medium text-gray-900">{sale.customerName}</p>
                         <p className="text-xs text-gray-500">
-                          {sale.items.length} {sale.items.length === 1 ? 'libro' : 'libros'} • {sale.paymentMethod}
+                          {sale.items.length} {sale.items.length === 1 ? 'libro' : 'libros'} • {sale.paymentMethod || 'Efectivo'}
                         </p>
                       </div>
                       <span className="font-bold text-navy-800 text-sm">
